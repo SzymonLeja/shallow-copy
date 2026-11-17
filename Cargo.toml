@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/oiaf",
+    "crates/archive-cli",
+    "crates/crypto",
+    "crates/storage",
+    "crates/ingest",
+    "crates/policy",
+    "crates/preservation-guard",
+    "crates/recovery",
+    "connectors/filesystem",
+    "connectors/browser-chromium",
+    "apps/server",
+]
+resolver = "2"
+

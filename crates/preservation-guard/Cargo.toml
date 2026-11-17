@@ -1,0 +1,15 @@
+[package]
+name = "sc-preservation-guard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Preservation Guard core for destructive operation interception and impact analysis"
+
+[dependencies]
+sc-policy = { path = "../policy" }
+sc-storage = { path = "../storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

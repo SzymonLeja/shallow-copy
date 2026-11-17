@@ -1,0 +1,20 @@
+services:
+  core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: shallow-copy-server:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+      - ARCHIVE_PATH=/data/archive
+      - CATALOG_PATH=/data/state/catalog.sqlite
+      - PORT=8080
+    volumes:
+      - archive-data:/data/archive
+      - state-data:/data/state
+
+volumes:
+  archive-data:
+  state-data:

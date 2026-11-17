@@ -1,0 +1,14 @@
+{
+  "name": "@shallow-copy/specs",
+  "private": true,
+  "scripts": {
+    "compile": "tsp compile .",
+    "check": "tsp compile . --no-emit"
+  },
+  "devDependencies": {
+    "@typespec/compiler": "^0.63.0",
+    "@typespec/http": "^0.63.0",
+    "@typespec/rest": "^0.63.0",
+    "@typespec/openapi3": "^0.63.0"
+  }
+}

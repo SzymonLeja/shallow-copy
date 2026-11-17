@@ -1,0 +1,25 @@
+[package]
+name = "shallow-copy-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Core REST API Server and Orchestration Runtime for shallow-copy"
+
+[dependencies]
+axum = "0.8"
+oiaf = { path = "../../crates/oiaf" }
+sc-ingest = { path = "../../crates/ingest" }
+sc-policy = { path = "../../crates/policy" }
+sc-preservation-guard = { path = "../../crates/preservation-guard" }
+sc-recovery = { path = "../../crates/recovery" }
+sc-storage = { path = "../../crates/storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

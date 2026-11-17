@@ -1,0 +1,10 @@
+[package]
+name = "sc-policy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Domain boundary and scope isolation policy core"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

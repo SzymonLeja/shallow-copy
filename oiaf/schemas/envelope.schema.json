@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shallow-copy.org/schemas/oiaf/0.1/envelope.json",
+  "title": "OIAF Evidence Envelope",
+  "description": "Evidence envelope schema for OIAF 0.1-archive-only format",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "oiaf_version",
+    "object_id",
+    "blob",
+    "source",
+    "time"
+  ],
+  "properties": {
+    "oiaf_version": {
+      "type": "string",
+      "const": "0.1-archive-only"
+    },
+    "object_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 hex digest computed over canonical source identity tuple"
+    },
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest", "size"],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "const": "sha256"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase 64-hex SHA-256 digest of payload bytes"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte count of canonical payload"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connector",
+        "source_instance",
+        "external_id",
+        "revision",
+        "source_locator"
+      ],
+      "properties": {
+        "connector": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "source_instance": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "external_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "source_locator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "description": "Opaque locator string, never parsed as local path"
+        }
+      }
+    },
+    "time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observed_time_unix_ms",
+        "ingested_time_unix_ms"
+      ],
+      "properties": {
+        "event_time_unix_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "observed_time_unix_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ingested_time_unix_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "processed_time_unix_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
