@@ -72,13 +72,20 @@ impl FilesystemConnector {
             )));
         }
 
+        let entries = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+        self.scan_entries(entries)
+    }
+
+    fn scan_entries<I>(&self, entries: I) -> Result<IngestEnvelope>
+    where
+        I: IntoIterator<Item = std::result::Result<walkdir::DirEntry, walkdir::Error>>,
+    {
+        let root = &self.config.root_dir;
         let mut items = Vec::new();
 
-        for entry in walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-        {
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| Error::Invalid(format!("walkdir traversal failed: {e}")))?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -107,6 +114,8 @@ impl FilesystemConnector {
                 suggested_domain: Some("private".into()),
             });
         }
+
+        items.sort_by(|a, b| a.external_id.cmp(&b.external_id));
 
         Ok(IngestEnvelope {
             source_instance: self.config.source_instance.clone(),
@@ -140,9 +149,12 @@ mod tests {
         assert_eq!(envelope.source_instance, "test-box");
         assert_eq!(envelope.items.len(), 2);
 
-        let ids: Vec<_> = envelope.items.iter().map(|i| &i.external_id).collect();
-        assert!(ids.contains(&&"file1.txt".to_string()));
-        assert!(ids.contains(&&"sub/file2.log".to_string()));
+        let ids: Vec<_> = envelope
+            .items
+            .iter()
+            .map(|i| i.external_id.as_str())
+            .collect();
+        assert_eq!(ids, ["file1.txt", "sub/file2.log"]);
     }
 
     #[test]
@@ -152,5 +164,22 @@ mod tests {
             root_dir: PathBuf::from("nonexistent-path-abc-123"),
         });
         assert!(connector.scan().is_err());
+    }
+
+    #[test]
+    fn fails_on_walkdir_traversal_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = FilesystemConnector::new(FilesystemConnectorConfig {
+            source_instance: "test-box".into(),
+            root_dir: dir.path().to_path_buf(),
+        });
+
+        let missing = dir.path().join("missing");
+        let result = connector.scan_entries(walkdir::WalkDir::new(missing));
+
+        assert!(matches!(
+            result,
+            Err(Error::Invalid(message)) if message.contains("walkdir traversal failed")
+        ));
     }
 }

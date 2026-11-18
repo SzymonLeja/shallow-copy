@@ -19,10 +19,21 @@ const JSON_LIMIT: u64 = 1024 * 1024;
 const MANIFEST_LIMIT: u64 = 16 * JSON_LIMIT;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupManifest {
+    pub oiaf_version: String,
+    pub timestamp_unix_ms: u64,
+    pub total_objects: usize,
+    pub total_blob_bytes: u64,
+    pub root_manifest_hash: String,
+    pub envelopes: BTreeMap<String, String>,
+}
+
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
     Json(serde_json::Error),
+    Crypto(sc_crypto::Error),
     Invalid(String),
     Integrity(String),
     Locked,
@@ -35,6 +46,7 @@ impl fmt::Display for Error {
         match self {
             Self::Io(e) => write!(f, "I/O: {e}"),
             Self::Json(e) => write!(f, "JSON: {e}"),
+            Self::Crypto(e) => write!(f, "domain encryption: {e}"),
             Self::Invalid(e) => write!(f, "invalid archive input: {e}"),
             Self::Integrity(e) => write!(f, "local fixity failure: {e}"),
             Self::Locked => f.write_str("archive writer is already locked"),
@@ -51,6 +63,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(e) => Some(e),
             Self::Json(e) => Some(e),
+            Self::Crypto(e) => Some(e),
             _ => None,
         }
     }
@@ -64,6 +77,11 @@ impl From<io::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+impl From<sc_crypto::Error> for Error {
+    fn from(value: sc_crypto::Error) -> Self {
+        Self::Crypto(value)
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -121,12 +139,37 @@ impl Source {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveDomain {
+    Public,
+    Private,
+    Restricted,
+    Legacy,
+    Secrets,
+}
+
+impl ArchiveDomain {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+            Self::Restricted => "restricted",
+            Self::Legacy => "legacy",
+            Self::Secrets => "secrets",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Blob {
     pub algorithm: String,
     pub digest: String,
     pub size: u64,
+    /// Absent for legacy plaintext blobs; included in the object envelope hash otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<ArchiveDomain>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,7 +356,10 @@ fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn read_json<T: DeserializeOwned + Serialize>(path: &Path, limit: u64) -> Result<T> {
+fn read_json_snapshot<T: DeserializeOwned + Serialize>(
+    path: &Path,
+    limit: u64,
+) -> Result<(T, Vec<u8>)> {
     let file = open_regular(path)?;
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes)?;
@@ -324,7 +370,7 @@ fn read_json<T: DeserializeOwned + Serialize>(path: &Path, limit: u64) -> Result
     if json_bytes(&value)? != bytes {
         return Err(Error::Invalid("invalid metadata: noncanonical JSON".into()));
     }
-    Ok(value)
+    Ok((value, bytes))
 }
 
 fn open_regular(path: &Path) -> Result<File> {
@@ -448,7 +494,7 @@ impl Archive {
         }
     }
 
-    fn manifest(&self) -> Result<Manifest> {
+    fn manifest_snapshot(&self) -> Result<(Manifest, Vec<u8>)> {
         let mut version = String::new();
         open_regular(&safe_path(&self.root, "OIAF-VERSION")?)?
             .take(128)
@@ -456,8 +502,8 @@ impl Archive {
         if version != format!("{FORMAT_VERSION}\n") {
             return Err(Error::Invalid("unsupported OIAF version".into()));
         }
-        let manifest: Manifest =
-            read_json(&safe_path(&self.root, "manifest.json")?, MANIFEST_LIMIT)?;
+        let manifest_path = safe_path(&self.root, "manifest.json")?;
+        let (manifest, bytes) = read_json_snapshot::<Manifest>(&manifest_path, MANIFEST_LIMIT)?;
         if manifest.oiaf_version != FORMAT_VERSION {
             return Err(Error::Invalid("unsupported manifest version".into()));
         }
@@ -465,7 +511,11 @@ impl Archive {
             validate_digest(id)?;
             validate_digest(hash)?;
         }
-        Ok(manifest)
+        Ok((manifest, bytes))
+    }
+
+    fn manifest(&self) -> Result<Manifest> {
+        self.manifest_snapshot().map(|(manifest, _)| manifest)
     }
 
     fn writer_lock(&self) -> Result<File> {
@@ -598,6 +648,7 @@ impl Archive {
                 algorithm: "sha256".into(),
                 digest: hash,
                 size,
+                domain: None,
             },
             observed,
         )
@@ -616,9 +667,91 @@ impl Archive {
                 algorithm: "sha256".into(),
                 digest: digest(bytes),
                 size: bytes.len() as u64,
+                domain: None,
             },
             observed,
         )
+    }
+
+    /// Encrypt and import bytes under a canonical domain key. The domain is
+    /// recorded in the blob metadata and authenticated as AEAD associated data.
+    pub fn import_bytes_in_domain(
+        &self,
+        bytes: &[u8],
+        source: Source,
+        domain: ArchiveDomain,
+        domain_key: &[u8],
+    ) -> Result<ImportResult> {
+        source.validate()?;
+        let _lock = self.writer_lock()?;
+        let id = source.object_id()?;
+        let manifest = self.manifest()?;
+        if let Some(hash) = manifest.envelopes.get(&id) {
+            let envelope = self.envelope(&id, hash)?;
+            if envelope.source != source || envelope.blob.domain != Some(domain) {
+                return Err(Error::SourceConflict);
+            }
+            let existing = self.read_domain_bytes(&id, domain, domain_key)?;
+            if existing != bytes {
+                return Err(Error::SourceConflict);
+            }
+            return Ok(ImportResult {
+                envelope,
+                created: false,
+            });
+        }
+
+        let sealed = sc_crypto::seal_domain(domain_key, bytes, domain.as_str())?;
+        let payload = serde_json::to_vec(&sealed)?;
+        let stage = Stage::new(&self.root)?;
+        write_new(&stage.0.join("payload"), &payload)?;
+        self.commit(
+            &stage,
+            source,
+            Blob {
+                algorithm: "sha256".into(),
+                digest: digest(&payload),
+                size: payload.len() as u64,
+                domain: Some(domain),
+            },
+            now_ms()?,
+        )
+    }
+
+    /// Read and authenticate a domain-encrypted object using its expected domain.
+    pub fn read_domain_bytes(
+        &self,
+        object_id: &str,
+        expected_domain: ArchiveDomain,
+        domain_key: &[u8],
+    ) -> Result<Vec<u8>> {
+        validate_digest(object_id)?;
+        let manifest = self.manifest()?;
+        let hash = manifest
+            .envelopes
+            .get(object_id)
+            .ok_or_else(|| Error::Invalid("unknown object ID".into()))?;
+        let envelope = self.envelope(object_id, hash)?;
+        if envelope.blob.domain != Some(expected_domain) {
+            return Err(Error::Integrity("blob domain mismatch".into()));
+        }
+
+        let path = safe_path(&self.root, &blob_relative_path(&envelope.blob.digest)?)?;
+        let mut file = open_regular(&path)?;
+        let mut payload = Vec::new();
+        file.read_to_end(&mut payload)?;
+        if payload.len() as u64 != envelope.blob.size || digest(&payload) != envelope.blob.digest {
+            return Err(Error::Integrity(format!("blob {}", envelope.blob.digest)));
+        }
+        let sealed: sc_crypto::DomainSealedEnvelope = serde_json::from_slice(&payload)?;
+        if sealed.domain != expected_domain.as_str() {
+            return Err(Error::Integrity("sealed payload domain mismatch".into()));
+        }
+        Ok(sc_crypto::open_domain(
+            domain_key,
+            &sealed,
+            expected_domain.as_str(),
+        )?)
     }
 
     fn commit(
@@ -730,6 +863,63 @@ impl Archive {
             output.write_all(&json_bytes(&envelope)?)?;
         }
         Ok(())
+    }
+
+    /// Deterministic backup manifest snapshot sorted by object ID.
+    pub fn generate_backup_manifest(&self) -> Result<BackupManifest> {
+        let (manifest, manifest_bytes) = self.manifest_snapshot()?;
+        let root_manifest_hash = digest(&manifest_bytes);
+        let mut blob_digests = BTreeSet::new();
+        let mut total_blob_bytes = 0_u64;
+        for (id, hash) in &manifest.envelopes {
+            let envelope = self.envelope(id, hash)?;
+            self.verify_blob(&envelope.blob)?;
+            if blob_digests.insert(envelope.blob.digest) {
+                total_blob_bytes = total_blob_bytes
+                    .checked_add(envelope.blob.size)
+                    .ok_or_else(|| Error::Invalid("total size overflow".into()))?;
+            }
+        }
+
+        Ok(BackupManifest {
+            oiaf_version: FORMAT_VERSION.into(),
+            timestamp_unix_ms: now_ms()?,
+            total_objects: manifest.envelopes.len(),
+            total_blob_bytes,
+            root_manifest_hash,
+            envelopes: manifest.envelopes,
+        })
+    }
+
+    pub fn verify_backup_manifest(&self, manifest: &BackupManifest) -> Result<bool> {
+        let (live_manifest, manifest_bytes) = self.manifest_snapshot()?;
+        if digest(&manifest_bytes) != manifest.root_manifest_hash
+            || manifest.oiaf_version != live_manifest.oiaf_version
+            || manifest.envelopes != live_manifest.envelopes
+            || manifest.total_objects != live_manifest.envelopes.len()
+        {
+            return Ok(false);
+        }
+
+        let mut total_blob_bytes = 0_u64;
+        let mut blob_digests = BTreeSet::new();
+        for (id, hash) in &live_manifest.envelopes {
+            let envelope = match self.envelope(id, hash) {
+                Ok(env) => env,
+                Err(_) => return Ok(false),
+            };
+            if self.verify_blob(&envelope.blob).is_err() {
+                return Ok(false);
+            }
+            if blob_digests.insert(envelope.blob.digest) {
+                total_blob_bytes = match total_blob_bytes.checked_add(envelope.blob.size) {
+                    Some(sum) => sum,
+                    None => return Ok(false),
+                };
+            }
+        }
+
+        Ok(total_blob_bytes == manifest.total_blob_bytes)
     }
 
     /// Publish a self-contained, verified directory copy at a previously absent
@@ -1032,9 +1222,263 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(read_json::<Manifest>(&path, MANIFEST_LIMIT).is_err());
+        assert!(read_json_snapshot::<Manifest>(&path, MANIFEST_LIMIT).is_err());
         fs::write(&path, vec![b' '; 129]).unwrap();
-        assert!(read_json::<Manifest>(&path, 128).is_err());
+        assert!(read_json_snapshot::<Manifest>(&path, 128).is_err());
+    }
+
+    #[test]
+    fn domain_encrypted_import_export_readback_and_retry() {
+        let dir = test_dir();
+        let archive = Archive::init(dir.0.join("archive")).unwrap();
+        let destination = dir.0.join("encrypted-export");
+        let source = Source::filesystem("test", "private-note", "1");
+        let plaintext = b"domain encrypted archival payload";
+        let key = [0x42; 32];
+
+        let imported = archive
+            .import_bytes_in_domain(plaintext, source.clone(), ArchiveDomain::Private, &key)
+            .unwrap();
+        assert!(imported.created);
+        assert_eq!(imported.envelope.blob.domain, Some(ArchiveDomain::Private));
+        let stored = fs::read(
+            archive
+                .root()
+                .join(blob_relative_path(&imported.envelope.blob.digest).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            !stored
+                .windows(plaintext.len())
+                .any(|window| window == plaintext)
+        );
+
+        let retry = archive
+            .import_bytes_in_domain(plaintext, source, ArchiveDomain::Private, &key)
+            .unwrap();
+        assert!(!retry.created);
+        assert_eq!(retry.envelope, imported.envelope);
+        assert_eq!(
+            archive
+                .read_domain_bytes(&imported.envelope.object_id, ArchiveDomain::Private, &key)
+                .unwrap(),
+            plaintext
+        );
+        assert!(
+            archive
+                .read_domain_bytes(
+                    &imported.envelope.object_id,
+                    ArchiveDomain::Restricted,
+                    &key
+                )
+                .is_err()
+        );
+        assert!(
+            archive
+                .read_domain_bytes(
+                    &imported.envelope.object_id,
+                    ArchiveDomain::Private,
+                    &[0x24; 32]
+                )
+                .is_err()
+        );
+
+        let report = archive.export(&destination, None).unwrap();
+        let exported = Archive::open(&destination).unwrap();
+        assert_eq!(exported.verify(true).unwrap(), report);
+        assert_eq!(
+            exported
+                .read_domain_bytes(&imported.envelope.object_id, ArchiveDomain::Private, &key)
+                .unwrap(),
+            plaintext
+        );
+    }
+
+    fn replace_encrypted_payload(
+        archive: &Archive,
+        object_id: &str,
+        payload: &[u8],
+        domain: ArchiveDomain,
+    ) {
+        let mut envelope = archive.provenance(object_id).unwrap();
+        let blob_path = archive
+            .root()
+            .join(blob_relative_path(&envelope.blob.digest).unwrap());
+        fs::write(blob_path, payload).unwrap();
+        envelope.blob.digest = digest(payload);
+        envelope.blob.size = payload.len() as u64;
+        envelope.blob.domain = Some(domain);
+        let envelope_bytes = json_bytes(&envelope).unwrap();
+        fs::write(
+            archive
+                .root()
+                .join(envelope_relative_path(object_id).unwrap()),
+            &envelope_bytes,
+        )
+        .unwrap();
+        let mut manifest = archive.manifest().unwrap();
+        manifest
+            .envelopes
+            .insert(object_id.to_string(), digest(&envelope_bytes));
+        fs::write(
+            archive.root().join("manifest.json"),
+            json_bytes(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn domain_binding_and_ciphertext_tampering_are_rejected() {
+        let key = [0x51; 32];
+        for tamper_domain in [false, true] {
+            let dir = test_dir();
+            let archive = Archive::init(dir.0.join("archive")).unwrap();
+            let imported = archive
+                .import_bytes_in_domain(
+                    b"authenticated payload",
+                    Source::filesystem("test", "secret", "1"),
+                    ArchiveDomain::Private,
+                    &key,
+                )
+                .unwrap();
+            let blob_path = archive
+                .root()
+                .join(blob_relative_path(&imported.envelope.blob.digest).unwrap());
+            let mut sealed: sc_crypto::DomainSealedEnvelope =
+                serde_json::from_slice(&fs::read(&blob_path).unwrap()).unwrap();
+            if tamper_domain {
+                sealed.domain = "restricted".into();
+            } else {
+                let mut ciphertext = sealed.ciphertext_b64.into_bytes();
+                ciphertext[0] = if ciphertext[0] == b'A' { b'B' } else { b'A' };
+                sealed.ciphertext_b64 = String::from_utf8(ciphertext).unwrap();
+            }
+            let payload = serde_json::to_vec(&sealed).unwrap();
+            replace_encrypted_payload(
+                &archive,
+                &imported.envelope.object_id,
+                &payload,
+                if tamper_domain {
+                    ArchiveDomain::Restricted
+                } else {
+                    ArchiveDomain::Private
+                },
+            );
+            let reopened = Archive::open(archive.root()).unwrap();
+            let expected_domain = if tamper_domain {
+                ArchiveDomain::Restricted
+            } else {
+                ArchiveDomain::Private
+            };
+            assert!(
+                reopened
+                    .read_domain_bytes(&imported.envelope.object_id, expected_domain, &key)
+                    .is_err()
+            );
+        }
+
+        let dir = test_dir();
+        let archive = Archive::init(dir.0.join("archive")).unwrap();
+        let imported = archive
+            .import_bytes_in_domain(
+                b"plain visible only after decryption",
+                Source::filesystem("test", "tampered", "1"),
+                ArchiveDomain::Private,
+                &key,
+            )
+            .unwrap();
+        let blob_path = archive
+            .root()
+            .join(blob_relative_path(&imported.envelope.blob.digest).unwrap());
+        fs::write(blob_path, b"altered physical payload").unwrap();
+        assert!(
+            archive
+                .read_domain_bytes(&imported.envelope.object_id, ArchiveDomain::Private, &key)
+                .is_err()
+        );
+        assert!(archive.verify(true).is_err());
+    }
+
+    #[test]
+    fn backup_manifest_creation_verification_and_tamper_detection() {
+        let dir = test_dir();
+        let archive = Archive::init(dir.0.join("archive")).unwrap();
+        let s1 = Source::filesystem("test", "doc1", "1");
+        let s2 = Source::filesystem("test", "doc2", "1");
+        let e1 = archive.import_bytes(b"hello world", s1).unwrap().envelope;
+        let e2 = archive
+            .import_bytes(b"second blob data", s2)
+            .unwrap()
+            .envelope;
+        let s3 = Source::filesystem("test", "doc3", "1");
+        let e3 = archive.import_bytes(b"hello world", s3).unwrap().envelope;
+
+        // Creation check
+        let root_manifest_path = archive.root().join("manifest.json");
+        let root_manifest_before = fs::read(&root_manifest_path).unwrap();
+        let backup = archive.generate_backup_manifest().unwrap();
+        assert_eq!(backup.oiaf_version, FORMAT_VERSION);
+        assert_eq!(backup.total_objects, 3);
+        assert_eq!(backup.total_blob_bytes, e1.blob.size + e2.blob.size);
+        assert_eq!(backup.envelopes.len(), 3);
+        assert_eq!(fs::read(&root_manifest_path).unwrap(), root_manifest_before);
+        assert_eq!(
+            backup.envelopes.get(&e1.object_id).unwrap(),
+            &digest(&json_bytes(&e1).unwrap())
+        );
+        assert_eq!(
+            backup.envelopes.get(&e2.object_id).unwrap(),
+            &digest(&json_bytes(&e2).unwrap())
+        );
+        assert_eq!(
+            backup.envelopes.get(&e3.object_id).unwrap(),
+            &digest(&json_bytes(&e3).unwrap())
+        );
+
+        let manifest_bytes = fs::read(&root_manifest_path).unwrap();
+        assert_eq!(backup.root_manifest_hash, digest(&manifest_bytes));
+
+        // Verification check
+        assert!(archive.verify_backup_manifest(&backup).unwrap());
+
+        // Tamper detection: root_manifest_hash modified
+        let mut tampered = backup.clone();
+        tampered.root_manifest_hash = "0".repeat(64);
+        assert!(!archive.verify_backup_manifest(&tampered).unwrap());
+
+        // Tamper detection: total_blob_bytes modified
+        let mut tampered = backup.clone();
+        tampered.total_blob_bytes += 1;
+        assert!(!archive.verify_backup_manifest(&tampered).unwrap());
+
+        // Tamper detection: total_objects modified
+        let mut tampered = backup.clone();
+        tampered.total_objects += 1;
+        assert!(!archive.verify_backup_manifest(&tampered).unwrap());
+
+        // Tamper detection: oiaf_version modified
+        let mut tampered = backup.clone();
+        tampered.oiaf_version = "invalid-version".into();
+        assert!(!archive.verify_backup_manifest(&tampered).unwrap());
+
+        // Tamper detection: envelopes map modified with unknown entry
+        let mut tampered = backup.clone();
+        tampered.envelopes.insert("0".repeat(64), "1".repeat(64));
+        tampered.total_objects = tampered.envelopes.len();
+        assert!(!archive.verify_backup_manifest(&tampered).unwrap());
+
+        // Tamper detection: a self-consistent subset still omits live objects.
+        let mut tampered = backup.clone();
+        tampered.envelopes.remove(&e1.object_id);
+        tampered.total_objects = tampered.envelopes.len();
+        assert!(!archive.verify_backup_manifest(&tampered).unwrap());
+
+        // Tamper detection: physical blob modified on disk
+        let blob_path = archive
+            .root()
+            .join(blob_relative_path(&e1.blob.digest).unwrap());
+        fs::write(&blob_path, b"corrupted payload").unwrap();
+        assert!(!archive.verify_backup_manifest(&backup).unwrap());
     }
 
     #[cfg(unix)]

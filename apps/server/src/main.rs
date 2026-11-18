@@ -28,7 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(a) => a,
         Err(_) => {
             info!("Archive not found at {archive_path}; initializing new archive...");
-            std::fs::create_dir_all(&archive_path)?;
+            if let Some(parent) = PathBuf::from(&archive_path).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             Archive::init(&archive_path)?
         }
     };

@@ -1,0 +1,1016 @@
+openapi: 3.0.0
+info:
+  title: Shallow Copy API
+  version: 0.0.0
+tags:
+  - name: Archive
+  - name: Auth
+  - name: Jobs
+  - name: Health
+  - name: System
+paths:
+  /health:
+    get:
+      operationId: HealthApi_get
+      description: Service health check endpoint
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                type: string
+      tags:
+        - Health
+  /v1/archive/audit:
+    get:
+      operationId: ArchiveAuditApi_list
+      description: List append-only audit events
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+          explode: false
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - type: array
+                    items:
+                      $ref: '#/components/schemas/AuditEvent'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+  /v1/archive/backup-manifest/generate:
+    post:
+      operationId: BackupManifestApi_generate
+      description: Generate a backup manifest snapshot
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/BackupManifest'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+  /v1/archive/backup-manifest/verify:
+    post:
+      operationId: BackupManifestApi_verify
+      description: Verify a backup manifest snapshot against live archive
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/BackupManifestVerifyResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BackupManifest'
+  /v1/archive/export:
+    post:
+      operationId: ExportApi_run
+      description: Export archive or single object
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/Job'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportRequest'
+  /v1/archive/guard/action:
+    post:
+      operationId: GuardApi_action
+      description: Confirm and transition a guarded destructive operation to quarantine
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/GuardActionResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GuardActionRequest'
+  /v1/archive/guard/analyze:
+    post:
+      operationId: GuardApi_analyze
+      description: Analyze impact of a guarded destructive operation
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/GuardAnalyzeResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GuardAnalyzeRequest'
+  /v1/archive/ingest/browser-history:
+    post:
+      operationId: BrowserHistoryIngestApi_ingest
+      description: Ingest browser history visits from server-configured Chromium history database
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/BrowserHistoryIngestResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrowserHistoryIngestRequest'
+  /v1/archive/objects:
+    get:
+      operationId: ArchiveObjectsApi_list
+      description: List objects with cursor pagination
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          explode: false
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+          explode: false
+        - name: domain
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/ArchiveDomain'
+          explode: false
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/ObjectListResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+  /v1/archive/objects/{objectId}:
+    get:
+      operationId: ArchiveObjectsApi_get
+      description: Get provenance envelope for one object
+      parameters:
+        - name: objectId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Sha256Digest'
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/SourceObject'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+  /v1/archive/recovery/drill:
+    post:
+      operationId: RecoveryApi_drill
+      description: Run an offline/standalone recovery verification drill
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/RecoveryDrillResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+  /v1/archive/verify:
+    post:
+      operationId: VerifyApi_run
+      description: Trigger a verification run; returns Job
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/Job'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Archive
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                full:
+                  type: boolean
+  /v1/auth/session:
+    post:
+      operationId: AuthApi_login
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/SessionToken'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+    delete:
+      operationId: AuthApi_logout
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '204':
+          description: 'There is no content to send for this request, but the headers may be useful. '
+      tags:
+        - Auth
+  /v1/jobs:
+    get:
+      operationId: JobsApi_list
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+          explode: false
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Job'
+                    required:
+                      - items
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Jobs
+  /v1/jobs/{jobId}:
+    get:
+      operationId: JobsApi_get
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Ulid'
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/Job'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - Jobs
+  /v1/system/readiness:
+    get:
+      operationId: SystemReadinessApi_getReadiness
+      description: Get authenticated system readiness and operational metrics
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemReadinessResponse'
+      tags:
+        - System
+  /v1/system/setup:
+    get:
+      operationId: SystemSetupApi_getStatus
+      description: Get current first-run setup state and configuration readiness
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/SystemSetupStatus'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - System
+    post:
+      operationId: SystemSetupApi_configure
+      description: Execute first-run core setup configuration (replays will be rejected)
+      parameters: []
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/SystemSetupResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - System
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SystemSetupRequest'
+components:
+  schemas:
+    ArchiveDomain:
+      type: string
+      enum:
+        - public
+        - private
+        - restricted
+        - legacy
+        - secrets
+      description: Archive domain
+    AuditEvent:
+      type: object
+      required:
+        - id
+        - event_type
+        - actor
+        - created_unix_ms
+      properties:
+        id:
+          type: string
+        event_type:
+          type: string
+        actor:
+          type: string
+        object_id:
+          type: string
+        details_json:
+          type: string
+        created_unix_ms:
+          type: integer
+          format: int64
+      description: Catalog append-only audit event
+    BackupManifest:
+      type: object
+      required:
+        - oiaf_version
+        - timestamp_unix_ms
+        - total_objects
+        - total_blob_bytes
+        - root_manifest_hash
+        - envelopes
+      properties:
+        oiaf_version:
+          type: string
+        timestamp_unix_ms:
+          type: integer
+          format: int64
+        total_objects:
+          type: integer
+          format: int32
+        total_blob_bytes:
+          type: integer
+          format: int64
+        root_manifest_hash:
+          $ref: '#/components/schemas/Sha256Digest'
+        envelopes:
+          type: object
+          additionalProperties:
+            type: string
+      description: OIAF Backup Manifest snapshot
+    BackupManifestVerifyResponse:
+      type: object
+      required:
+        - valid
+      properties:
+        valid:
+          type: boolean
+      description: Backup manifest verification response
+    BrowserBookmarkRecord:
+      type: object
+      required:
+        - bookmarkId
+        - title
+        - url
+        - folderPath
+        - folder
+      properties:
+        bookmarkId:
+          type: string
+          description: Bookmark identifier from Chromium Bookmarks JSON
+        title:
+          type: string
+          description: Bookmark title
+        url:
+          type: string
+          description: Bookmark URL
+        folderPath:
+          type: array
+          items:
+            type: string
+          description: Folder path hierarchy elements from root to parent
+        folder:
+          type: string
+          description: Formatted slash-separated folder path
+        dateAddedRaw:
+          type: string
+          description: Raw date added string from Chromium Bookmarks JSON
+        dateAddedUnixMs:
+          type: integer
+          format: int64
+          description: Converted Unix millisecond epoch timestamp
+      description: Browser bookmark entry with folder hierarchy
+    BrowserHistoryIngestRequest:
+      type: object
+      properties:
+        sourceInstance:
+          type: string
+          description: Optional logical source instance identifier override
+      description: Request parameters for browser history ingestion (source database is server-configured).
+    BrowserHistoryIngestResponse:
+      type: object
+      required:
+        - sourceInstance
+        - totalVisits
+        - importedCount
+        - skippedCount
+        - objectIds
+      properties:
+        sourceInstance:
+          type: string
+          description: Effective source instance identifier
+        totalVisits:
+          type: integer
+          format: int64
+          description: Total visit records discovered in configured history database
+        importedCount:
+          type: integer
+          format: int64
+          description: Number of newly imported objects
+        skippedCount:
+          type: integer
+          format: int64
+          description: Number of duplicate visits skipped due to existing fingerprint
+        objectIds:
+          type: array
+          items:
+            $ref: '#/components/schemas/Sha256Digest'
+          description: List of object IDs corresponding to ingested visits
+      description: Result summary of browser history ingestion
+    BrowserVisitRecord:
+      type: object
+      required:
+        - visitId
+        - url
+        - visitTimeRaw
+      properties:
+        visitId:
+          type: integer
+          format: int64
+          description: Unique visit identifier
+        url:
+          type: string
+          description: Visited URL
+        title:
+          type: string
+          description: Page title if recorded by browser
+        visitCount:
+          type: integer
+          format: int64
+          description: Cumulative visit count for this URL
+        visitTimeRaw:
+          type: integer
+          format: int64
+          description: Raw Chromium microsecond timestamp
+        eventTimeUnixMs:
+          type: integer
+          format: int64
+          description: Converted Unix millisecond epoch timestamp
+        transitionRaw:
+          type: integer
+          format: int64
+          description: Raw numeric transition code from Chromium database
+        transitionType:
+          allOf:
+            - $ref: '#/components/schemas/PageTransitionType'
+          description: Normalized transition type
+      description: Enriched browser visit entry stored in OIAF archive
+    ErrorResponse:
+      type: object
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        requestId:
+          type: string
+        details:
+          type: object
+          additionalProperties: {}
+      description: Standard error response
+    ExportRequest:
+      type: object
+      required:
+        - destination
+      properties:
+        destination:
+          type: string
+        objectId:
+          $ref: '#/components/schemas/Sha256Digest'
+        format:
+          type: string
+          enum:
+            - oiaf
+            - jsonl
+    ExportResult:
+      type: object
+      required:
+        - objects
+        - blobs
+        - bytes
+        - destination
+      properties:
+        objects:
+          type: integer
+          format: int32
+        blobs:
+          type: integer
+          format: int32
+        bytes:
+          type: integer
+          format: int64
+        destination:
+          type: string
+    GuardActionRequest:
+      type: object
+      required:
+        - sessionId
+        - confirmationToken
+        - typedConfirmation
+        - allowUnverifiedBackupOverride
+      properties:
+        sessionId:
+          type: string
+        confirmationToken:
+          type: string
+        typedConfirmation:
+          type: string
+        allowUnverifiedBackupOverride:
+          type: boolean
+    GuardActionResponse:
+      type: object
+      required:
+        - sessionId
+        - state
+        - stepUpConfirmed
+      properties:
+        sessionId:
+          type: string
+        state:
+          $ref: '#/components/schemas/GuardState'
+        stepUpConfirmed:
+          type: boolean
+        quarantineDeadlineUnixMs:
+          type: integer
+          format: int64
+    GuardAnalyzeRequest:
+      type: object
+      required:
+        - objectIds
+      properties:
+        objectIds:
+          type: array
+          items:
+            type: string
+    GuardAnalyzeResponse:
+      type: object
+      required:
+        - sessionId
+        - confirmationToken
+        - confirmationExpiresAtUnixMs
+        - impact
+      properties:
+        sessionId:
+          type: string
+        confirmationToken:
+          type: string
+        confirmationExpiresAtUnixMs:
+          type: integer
+          format: int64
+        impact:
+          $ref: '#/components/schemas/ImpactReport'
+    GuardState:
+      type: string
+      enum:
+        - requested
+        - impact_analysis
+        - dry_run_ready
+        - explicit_confirmation
+        - quarantine_delay
+        - committed
+        - cancelled
+        - restored
+      description: Preservation Guard lifecycle states
+    ImpactReport:
+      type: object
+      required:
+        - affected_objects
+        - affected_bytes
+        - is_reversible
+        - has_verified_backup
+        - warnings
+      properties:
+        affected_objects:
+          type: integer
+          format: int32
+        affected_bytes:
+          type: integer
+          format: int64
+        is_reversible:
+          type: boolean
+        has_verified_backup:
+          type: boolean
+        backup_checkpoint_timestamp:
+          type: integer
+          format: int64
+        warnings:
+          type: array
+          items:
+            type: string
+      description: Evaluated impact report for requested guarded operation
+    Job:
+      type: object
+      required:
+        - jobId
+        - kind
+        - status
+        - createdAt
+        - updatedAt
+      properties:
+        jobId:
+          $ref: '#/components/schemas/Ulid'
+        kind:
+          type: string
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        progressPct:
+          type: integer
+          format: int32
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        error:
+          type: string
+    JobStatus:
+      type: string
+      enum:
+        - pending
+        - running
+        - completed
+        - failed
+        - cancelled
+    LoginRequest:
+      type: object
+      required:
+        - password
+      properties:
+        password:
+          type: string
+    ObjectListResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SourceObject'
+        nextCursor:
+          type: string
+        total:
+          type: integer
+          format: int64
+      description: Cursor-paginated list response
+    PageTransitionType:
+      type: string
+      enum:
+        - link
+        - typed
+        - auto_bookmark
+        - auto_subframe
+        - manual_subframe
+        - generated
+        - auto_toplevel
+        - form_submit
+        - reload
+        - keyword
+        - keyword_generated
+        - other
+      description: Page transition type for browser visits
+    RecoveryDrillResponse:
+      type: object
+      required:
+        - success
+        - objects_tested
+      properties:
+        success:
+          type: boolean
+        objects_tested:
+          type: integer
+          format: int32
+      description: Recovery drill execution response
+    Scope:
+      type: string
+      enum:
+        - archive.read
+        - archive.write
+        - archive.destructive
+        - recovery.manage
+        - connector.manage
+        - knowledge.read
+        - persona.use
+        - secrets.read
+      description: Available permission scopes
+    SessionToken:
+      type: object
+      required:
+        - token
+        - deviceId
+        - scopes
+        - expiresAt
+      properties:
+        token:
+          type: string
+        deviceId:
+          type: string
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Scope'
+        expiresAt:
+          type: string
+          format: date-time
+    Sha256Digest:
+      type: string
+      description: SHA-256 hex digest (64 lowercase hex chars)
+    SourceObject:
+      type: object
+      required:
+        - objectId
+        - domain
+        - blobDigest
+        - blobSize
+        - blobAlgorithm
+        - connectorId
+        - sourceInstance
+        - externalId
+        - revision
+        - sourceLocator
+        - observedTimeUnixMs
+        - ingestedTimeUnixMs
+      properties:
+        objectId:
+          $ref: '#/components/schemas/Sha256Digest'
+        domain:
+          $ref: '#/components/schemas/ArchiveDomain'
+        blobDigest:
+          $ref: '#/components/schemas/Sha256Digest'
+        blobSize:
+          type: integer
+          format: int64
+        blobAlgorithm:
+          type: string
+        connectorId:
+          type: string
+        sourceInstance:
+          type: string
+        externalId:
+          type: string
+        revision:
+          type: string
+        sourceLocator:
+          type: string
+        observedTimeUnixMs:
+          type: integer
+          format: int64
+        ingestedTimeUnixMs:
+          type: integer
+          format: int64
+        eventTimeUnixMs:
+          type: integer
+          format: int64
+      description: Evidence envelope for one source occurrence
+    SystemReadinessResponse:
+      type: object
+      required:
+        - archiveReady
+        - objectCount
+        - pendingJobs
+        - failedJobs
+        - filesystemIngestAvailable
+      properties:
+        archiveReady:
+          type: boolean
+        objectCount:
+          type: integer
+          format: int64
+        pendingJobs:
+          type: integer
+          format: int64
+        failedJobs:
+          type: integer
+          format: int64
+        filesystemIngestAvailable:
+          type: boolean
+        archivePath:
+          type: string
+          description: Safe canonicalized archive path if initialized
+        backupPath:
+          type: string
+          description: Safe canonicalized backup target directory path if configured
+      description: Authenticated system readiness and operational status
+    SystemSetupRequest:
+      type: object
+      required:
+        - recoveryConfirmed
+      properties:
+        archivePath:
+          type: string
+          description: Optional custom local archive directory path
+        backupPath:
+          type: string
+          description: Optional local directory backup target
+        recoveryConfirmed:
+          type: boolean
+          description: Acknowledgment confirming recovery material has been recorded and verified
+      description: Request body to complete first-run core setup
+    SystemSetupResponse:
+      type: object
+      required:
+        - success
+        - status
+        - message
+      properties:
+        success:
+          type: boolean
+          description: True if setup succeeded
+        status:
+          allOf:
+            - $ref: '#/components/schemas/SystemSetupStatus'
+          description: Updated setup status
+        message:
+          type: string
+          description: Informational description of configuration state
+      description: Result of first-run core setup execution (never returns secrets or raw recovery keys)
+    SystemSetupStatus:
+      type: object
+      required:
+        - archiveInitialized
+        - adminProvisioned
+        - recoveryConfigured
+        - isComplete
+      properties:
+        archiveInitialized:
+          type: boolean
+          description: True if the core archive storage directory and manifest exist and are initialized
+        adminProvisioned:
+          type: boolean
+          description: True if administrative credentials / session have been provisioned
+        recoveryConfigured:
+          type: boolean
+          description: True if recovery key / backup target is configured
+        isComplete:
+          type: boolean
+          description: True if the first-run setup has completed
+        archivePath:
+          type: string
+          description: Safe canonicalized archive path if initialized
+        backupPath:
+          type: string
+          description: Safe canonicalized backup target directory path if configured
+      description: First-run core setup state and configuration readiness
+    Ulid:
+      type: string
+      description: ULID string identifier
+    VerificationReport:
+      type: object
+      required:
+        - objects
+        - blobs
+        - bytes
+        - fixityOnly
+        - startedAt
+        - completedAt
+      properties:
+        objects:
+          type: integer
+          format: int32
+        blobs:
+          type: integer
+          format: int32
+        bytes:
+          type: integer
+          format: int64
+        fixityOnly:
+          type: boolean
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time

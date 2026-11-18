@@ -8,6 +8,7 @@ description = "Core REST API Server and Orchestration Runtime for shallow-copy"
 [dependencies]
 axum = "0.8"
 oiaf = { path = "../../crates/oiaf" }
+sc-connector-browser-chromium = { path = "../../connectors/browser-chromium" }
 sc-ingest = { path = "../../crates/ingest" }
 sc-policy = { path = "../../crates/policy" }
 sc-preservation-guard = { path = "../../crates/preservation-guard" }
@@ -15,8 +16,11 @@ sc-recovery = { path = "../../crates/recovery" }
 sc-storage = { path = "../../crates/storage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

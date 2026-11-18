@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::json;
+use std::fs::File;
+use std::io::Write;
 
 pub trait ArchiveAdapter {
     type Output: Serialize;
@@ -19,7 +22,34 @@ pub trait ArchiveAdapter {
         destination: &Path,
         object_id: Option<&str>,
     ) -> Result<Self::Output, AdapterError>;
+    fn generate_backup_manifest(&self) -> Result<Self::Output, AdapterError>;
+    fn verify_backup_manifest(&self, manifest_path: &Path) -> Result<Self::Output, AdapterError>;
     fn provenance(&self, object_id: &str) -> Result<Self::Output, AdapterError>;
+    fn export_jsonl(&self, destination: Option<&Path>) -> Result<Self::Output, AdapterError>;
+}
+
+struct CountingWriter<W: Write> {
+    inner: W,
+    count: usize,
+}
+
+impl<W: Write> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, count: 0 }
+    }
+    fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.count += buf.iter().filter(|&&b| b == b'\n').count();
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 pub struct OiafAdapter {
@@ -81,6 +111,53 @@ impl ArchiveAdapter for OiafAdapter {
             .provenance(object_id)
             .map_err(AdapterError::from)?;
         serde_json::to_value(result).map_err(AdapterError::output)
+    }
+
+    fn export_jsonl(&self, destination: Option<&Path>) -> Result<Self::Output, AdapterError> {
+        match destination {
+            Some(path) => {
+                let file = File::create(path)
+                    .map_err(oiaf::Error::from)
+                    .map_err(AdapterError::from)?;
+                let mut writer = CountingWriter::new(file);
+                self.archive
+                    .export_jsonl(&mut writer)
+                    .map_err(AdapterError::from)?;
+                let count = writer.count();
+                serde_json::to_value(json!({"status":"ok","count":count}))
+                    .map_err(AdapterError::output)
+            }
+            None => {
+                let mut buffer = Vec::new();
+                self.archive
+                    .export_jsonl(&mut buffer)
+                    .map_err(AdapterError::from)?;
+                let count = buffer.iter().filter(|&&b| b == b'\n').count();
+                serde_json::to_value(json!({"status":"ok","count":count}))
+                    .map_err(AdapterError::output)
+            }
+        }
+    }
+
+    fn generate_backup_manifest(&self) -> Result<Self::Output, AdapterError> {
+        let result = self
+            .archive
+            .generate_backup_manifest()
+            .map_err(AdapterError::from)?;
+        serde_json::to_value(result).map_err(AdapterError::output)
+    }
+    fn verify_backup_manifest(&self, manifest_path: &Path) -> Result<Self::Output, AdapterError> {
+        let bytes = std::fs::read(manifest_path)
+            .map_err(oiaf::Error::from)
+            .map_err(AdapterError::from)?;
+        let manifest: oiaf::BackupManifest = serde_json::from_slice(&bytes)
+            .map_err(oiaf::Error::from)
+            .map_err(AdapterError::from)?;
+        let valid = self
+            .archive
+            .verify_backup_manifest(&manifest)
+            .map_err(AdapterError::from)?;
+        serde_json::to_value(serde_json::json!({ "valid": valid })).map_err(AdapterError::output)
     }
 }
 
@@ -167,6 +244,8 @@ fn sanitize(value: &str) -> String {
 mod tests {
     use super::*;
     use std::io;
+    // use std::fs::read_to_string;
+    // use std::env::temp_dir for test temp directories
 
     #[test]
     fn maps_public_error_variants_to_stable_cli_categories() {
@@ -201,5 +280,80 @@ mod tests {
             error.to_string(),
             r"corrupt archive data: bad\n\u{001b}[31mdata"
         );
+    }
+
+    #[test]
+    fn test_generate_and_verify_backup_manifest_tamper() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cli-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let archive_path = temp_dir.join("archive");
+        let _init = OiafAdapter::init(&archive_path).unwrap();
+        let adapter = OiafAdapter::open(&archive_path).unwrap();
+        let manifest_json = adapter.generate_backup_manifest().unwrap();
+        let manifest_path = temp_dir.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string(&manifest_json).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&manifest_path, b"tampered").unwrap();
+        let verify_err = adapter.verify_backup_manifest(&manifest_path);
+        assert!(verify_err.is_err());
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_export_jsonl_none() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cli-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let archive_path = temp_dir.join("archive");
+        let _init = OiafAdapter::init(&archive_path).unwrap();
+        let adapter = OiafAdapter::open(&archive_path).unwrap();
+        // Import a sample file to ensure the archive has at least one object
+        let sample_file = temp_dir.join("sample.txt");
+        std::fs::write(&sample_file, b"sample payload").unwrap();
+        adapter.import(&sample_file).unwrap();
+        let result = adapter.export_jsonl(None).unwrap();
+        let count = result.get("count").and_then(|v| v.as_u64()).unwrap();
+        assert!(count > 0);
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_export_jsonl_some() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cli-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let archive_path = temp_dir.join("archive");
+        let _init = OiafAdapter::init(&archive_path).unwrap();
+        let adapter = OiafAdapter::open(&archive_path).unwrap();
+        // Import a sample file to ensure the archive has at least one object
+        let sample_file = temp_dir.join("sample.txt");
+        std::fs::write(&sample_file, b"sample payload").unwrap();
+        adapter.import(&sample_file).unwrap();
+        let output_path = temp_dir.join("output.jsonl");
+        let result = adapter.export_jsonl(Some(&output_path)).unwrap();
+        let count = result.get("count").and_then(|v| v.as_u64()).unwrap();
+        assert!(count > 0);
+        let data = std::fs::read_to_string(&output_path).unwrap();
+        assert!(data.lines().count() == count as usize);
+        std::fs::remove_dir_all(&temp_dir).ok();
     }
 }

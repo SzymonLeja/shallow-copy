@@ -32,8 +32,4 @@ interface JobsApi {
   @get
   @route("/{jobId}")
   get(@path jobId: Ulid): Job | ErrorResponse;
-
-  @delete
-  @route("/{jobId}")
-  cancel(@path jobId: Ulid): void | ErrorResponse;
 }

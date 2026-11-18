@@ -19,6 +19,7 @@ enum Scope {
 
 model SessionToken {
   token: string;
+  deviceId: string;
   scopes: Scope[];
   expiresAt: utcDateTime;
 }

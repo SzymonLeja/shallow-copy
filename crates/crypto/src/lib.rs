@@ -11,7 +11,7 @@
 use argon2::{Argon2, Params, Version};
 use chacha20poly1305::{
     AeadCore, KeyInit, XChaCha20Poly1305,
-    aead::{Aead, OsRng},
+    aead::{Aead, AeadInPlace, OsRng, Tag},
 };
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -153,6 +153,88 @@ pub fn open(passphrase: &[u8], envelope: &SealedEnvelope) -> Result<Vec<u8>> {
         .map_err(|e| Error::Aead(e.to_string()))
 }
 
+// Domain‑separated encryption primitives
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainSealedEnvelope {
+    pub format_version: String,
+    pub cipher_suite: CipherSuite,
+    pub kdf: Kdf,
+    pub domain: String,
+    /// Base64-encoded 24-byte XChaCha20 nonce.
+    pub nonce_b64: String,
+    /// Base64-encoded ciphertext (includes 16-byte Poly1305 tag appended).
+    pub ciphertext_b64: String,
+}
+
+pub fn seal_domain(
+    passphrase: &[u8],
+    plaintext: &[u8],
+    domain: &str,
+) -> Result<DomainSealedEnvelope> {
+    let mut kdf = Kdf::recommended();
+    kdf.salt_b64 = generate_salt();
+    let key = derive_key(passphrase, &kdf)?;
+    let cipher = XChaCha20Poly1305::new((&key.0).into());
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    // Use domain as AAD.
+    let mut ciphertext = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(&nonce, domain.as_bytes(), &mut ciphertext)
+        .map_err(|e| Error::Aead(e.to_string()))?;
+    let mut final_ct = ciphertext;
+    final_ct.extend_from_slice(tag.as_slice());
+    let ciphertext = final_ct;
+    Ok(DomainSealedEnvelope {
+        format_version: FORMAT_VERSION.into(),
+        cipher_suite: CipherSuite::XChacha20Poly1305Argon2id,
+        kdf,
+        domain: domain.into(),
+        nonce_b64: base64_encode(&nonce),
+        ciphertext_b64: base64_encode(&ciphertext),
+    })
+}
+
+pub fn open_domain(
+    passphrase: &[u8],
+    envelope: &DomainSealedEnvelope,
+    domain: &str,
+) -> Result<Vec<u8>> {
+    if envelope.format_version != FORMAT_VERSION {
+        return Err(Error::Decode(format!(
+            "unsupported format version: {}",
+            envelope.format_version
+        )));
+    }
+    if envelope.cipher_suite != CipherSuite::XChacha20Poly1305Argon2id {
+        return Err(Error::Decode("unsupported cipher suite".into()));
+    }
+    if envelope.domain != domain {
+        return Err(Error::Decode("domain mismatch".into()));
+    }
+    let key = derive_key(passphrase, &envelope.kdf)?;
+    let cipher = XChaCha20Poly1305::new((&key.0).into());
+    let nonce_bytes = base64_decode(&envelope.nonce_b64)?;
+    if nonce_bytes.len() != 24 {
+        return Err(Error::Decode("invalid nonce length".into()));
+    }
+    let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
+    let ciphertext = base64_decode(&envelope.ciphertext_b64)?;
+    if ciphertext.len() < 16 {
+        return Err(Error::Decode("ciphertext too short".into()));
+    }
+    let (ct, tag) = ciphertext.split_at(ciphertext.len() - 16);
+    let mut buffer = ct.to_vec();
+    cipher
+        .decrypt_in_place_detached(
+            nonce,
+            domain.as_bytes(),
+            &mut buffer,
+            Tag::<XChaCha20Poly1305>::from_slice(tag),
+        )
+        .map_err(|e| Error::Aead(e.to_string()))?;
+    Ok(buffer)
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     base64_std(bytes)
 }
@@ -279,5 +361,44 @@ mod tests {
         let encoded = base64_std(&all_bytes);
         let decoded = base64_std_decode(&encoded).unwrap();
         assert_eq!(decoded, all_bytes);
+    }
+
+    #[test]
+    fn seal_domain_and_open_domain_roundtrip() {
+        let plaintext = b"domain secret";
+        let passphrase = b"passphrase";
+        let domain = "app";
+        let envelope = seal_domain(passphrase, plaintext, domain).unwrap();
+        let recovered = open_domain(passphrase, &envelope, domain).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn seal_domain_wrong_domain_fails() {
+        let envelope = seal_domain(b"pass", b"data", "app").unwrap();
+        assert!(open_domain(b"pass", &envelope, "other").is_err());
+    }
+
+    #[test]
+    fn seal_domain_tampered_ciphertext_fails() {
+        let mut envelope = seal_domain(b"pass", b"data", "app").unwrap();
+        let mut ct = base64_std_decode(&envelope.ciphertext_b64).unwrap();
+        ct[0] ^= 0xff;
+        envelope.ciphertext_b64 = base64_std(&ct);
+        assert!(open_domain(b"pass", &envelope, "app").is_err());
+    }
+
+    #[test]
+    fn domain_envelope_is_json_serializable_and_self_describing() {
+        let envelope = seal_domain(b"pass", b"hello", "app").unwrap();
+        let json = serde_json::to_string_pretty(&envelope).unwrap();
+        let restored: DomainSealedEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(open_domain(b"pass", &restored, "app").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn seal_domain_wrong_passphrase_fails() {
+        let envelope = seal_domain(b"right", b"payload", "app").unwrap();
+        assert!(open_domain(b"wrong", &envelope, "app").is_err());
     }
 }

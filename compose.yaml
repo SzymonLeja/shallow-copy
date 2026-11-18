@@ -5,15 +5,20 @@ services:
       dockerfile: Dockerfile
     image: shallow-copy-server:latest
     ports:
+      - "3000:8080"
       - "8080:8080"
     environment:
       - RUST_LOG=info
-      - ARCHIVE_PATH=/data/archive
+      - ARCHIVE_PATH=/data/archive/store
       - CATALOG_PATH=/data/state/catalog.sqlite
       - PORT=8080
     volumes:
       - archive-data:/data/archive
       - state-data:/data/state
+    command:
+      - sh
+      - -c
+      - 'if [ ! -f "$$ARCHIVE_PATH/manifest.json" ]; then archive-cli init "$$ARCHIVE_PATH"; fi; exec shallow-copy-server'
 
 volumes:
   archive-data:
