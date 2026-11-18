@@ -43,7 +43,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(catalog, archive);
     let app = create_router(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let host = env::var("BIND_ADDR")
+        .or_else(|_| env::var("HOST"))
+        .unwrap_or_else(|_| "127.0.0.1".into());
+    let ip: std::net::IpAddr = host
+        .parse()
+        .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+    if !ip.is_loopback() {
+        let token = env::var("BOOTSTRAP_TOKEN").unwrap_or_default();
+        if token.trim().is_empty() {
+            return Err(
+                "non-loopback bind requires a non-empty BOOTSTRAP_TOKEN environment variable for secure first-run setup".into(),
+            );
+        }
+    }
+    let addr = SocketAddr::new(ip, port);
     info!("shallow-copy-server listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

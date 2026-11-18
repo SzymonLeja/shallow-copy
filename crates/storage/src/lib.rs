@@ -99,6 +99,20 @@ pub struct CatalogJob {
     pub error: Option<String>,
 }
 
+/// Mode for provisioning owner credentials in the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerProvisionMode {
+    Fresh,
+    LegacyClaim,
+}
+
+/// Candidate archive and backup paths staged in memory for fresh setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshSetupConfig {
+    pub archive_path: String,
+    pub backup_path: Option<String>,
+}
+
 /// An append-only audit event stored in the catalog (ADR-009, project.md:33).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEvent {
@@ -154,6 +168,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Operational catalog backed by a local SQLite database.
 pub struct Catalog {
     conn: Connection,
+    pub test_fail_tx: bool,
 }
 
 impl Catalog {
@@ -162,7 +177,10 @@ impl Catalog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let cat = Self { conn };
+        let cat = Self {
+            conn,
+            test_fail_tx: false,
+        };
         cat.init_schema()?;
         Ok(cat)
     }
@@ -171,7 +189,10 @@ impl Catalog {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let cat = Self { conn };
+        let cat = Self {
+            conn,
+            test_fail_tx: false,
+        };
         cat.init_schema()?;
         Ok(cat)
     }
@@ -297,6 +318,175 @@ impl Catalog {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Atomically provision owner credentials under strict transactional predicates.
+    ///
+    /// - Fresh mode: requires that ALL legacy markers (`setup.admin_provisioned`,
+    ///   `setup.prepared_unix_ms`, `setup.completed_unix_ms`) AND `setup.owner_verifier`
+    ///   AND `setup.owner_auth_version` are ABSENT.
+    ///   Atomically commits `setup.archive_path`, `setup.backup_path` (if provided),
+    ///   `setup.owner_verifier`, `setup.owner_auth_version = "1"`,
+    ///   `setup.admin_provisioned = "true"`, `setup.prepared_unix_ms = "<now_ms>"`,
+    ///   and `setup.completed_unix_ms = "<now_ms>"`.
+    ///
+    /// - LegacyClaim mode: requires that ANY legacy marker (`setup.admin_provisioned == "true"`,
+    ///   `setup.prepared_unix_ms`, OR `setup.completed_unix_ms`) is PRESENT, AND
+    ///   BOTH `setup.owner_verifier` and `setup.owner_auth_version` are ABSENT.
+    ///   Atomically commits `setup.owner_verifier`, `setup.owner_auth_version = "1"`,
+    ///   and `setup.admin_provisioned = "true"`, preserving existing `setup.archive_path`,
+    ///   `setup.backup_path`, and all objects and audit events.
+    ///
+    /// Executes within a single SQLite IMMEDIATE transaction. First claimant wins
+    /// across connections; losing concurrent attempts or inconsistent states return
+    /// `Ok(false)` without mutating data.
+    pub fn provision_owner_credentials(
+        &mut self,
+        mode: OwnerProvisionMode,
+        verifier: &str,
+        fresh_config: Option<&FreshSetupConfig>,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let get_tx_meta = |key: &str| -> rusqlite::Result<Option<String>> {
+            let mut stmt = tx.prepare_cached("SELECT value FROM catalog_meta WHERE key = ?1")?;
+            let mut rows = stmt.query(params![key])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let has_owner_verifier = get_tx_meta("setup.owner_verifier")?.is_some();
+        let has_owner_auth_version = get_tx_meta("setup.owner_auth_version")?.is_some();
+        let has_admin_provisioned =
+            get_tx_meta("setup.admin_provisioned")?.is_some_and(|v| v == "true");
+        let has_prepared = get_tx_meta("setup.prepared_unix_ms")?.is_some();
+        let has_completed = get_tx_meta("setup.completed_unix_ms")?.is_some();
+        let has_any_legacy_marker = has_admin_provisioned || has_prepared || has_completed;
+
+        // If verifier or auth_version is already durable, credentials are fully configured.
+        if has_owner_verifier || has_owner_auth_version {
+            return Ok(false);
+        }
+
+        match mode {
+            OwnerProvisionMode::Fresh => {
+                // Fresh mode requires ALL legacy markers to be strictly absent.
+                if has_any_legacy_marker {
+                    return Ok(false);
+                }
+                let config = match fresh_config {
+                    Some(c) => c,
+                    None => return Ok(false),
+                };
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.archive_path', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![config.archive_path],
+                )?;
+
+                if let Some(ref bp) = config.backup_path {
+                    tx.execute(
+                        "INSERT INTO catalog_meta (key, value) VALUES ('setup.backup_path', ?1)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        params![bp],
+                    )?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM catalog_meta WHERE key = 'setup.backup_path'",
+                        [],
+                    )?;
+                }
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.owner_verifier', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![verifier],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.owner_auth_version', '1')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.admin_provisioned', 'true')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.recovery_configured', 'true')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.recovery_configured', 'true')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+
+                let now_str = now_ms.to_string();
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.prepared_unix_ms', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![now_str],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.completed_unix_ms', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![now_str],
+                )?;
+            }
+            OwnerProvisionMode::LegacyClaim => {
+                // Legacy claim requires AT LEAST ONE legacy marker present, and verifier/version absent.
+                if !has_any_legacy_marker {
+                    return Ok(false);
+                }
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.owner_verifier', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![verifier],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.owner_auth_version', '1')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.admin_provisioned', 'true')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES ('setup.recovery_configured', 'true')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+            }
+        }
+
+        if self.test_fail_tx {
+            return Err(Error::Invalid(
+                "injected transaction failure before commit".into(),
+            ));
+        }
+
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Insert or update a single object from a CatalogObject without changing
@@ -666,593 +856,5 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> SqlResult<CatalogJob> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use oiaf::{Archive, Source};
-
-    fn test_archive(dir: &tempfile::TempDir) -> Archive {
-        Archive::init(dir.path().join("archive")).unwrap()
-    }
-
-    fn test_source(name: &str, rev: &str) -> Source {
-        Source::filesystem("test", name, rev)
-    }
-
-    #[test]
-    fn empty_catalog_has_zero_objects() {
-        let cat = Catalog::open_in_memory().unwrap();
-        assert_eq!(cat.object_count().unwrap(), 0);
-        assert!(cat.list_objects().unwrap().is_empty());
-    }
-
-    #[test]
-    fn rebuild_from_archive_imports_all_objects() {
-        let tmp = tempfile::tempdir().unwrap();
-        let archive = test_archive(&tmp);
-        archive
-            .import_bytes(b"alpha", test_source("alpha", "1"))
-            .unwrap();
-        archive
-            .import_bytes(b"beta", test_source("beta", "1"))
-            .unwrap();
-        let mut cat = Catalog::open_in_memory().unwrap();
-        let count = cat.rebuild_from_archive(&archive).unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(cat.object_count().unwrap(), 2);
-    }
-
-    #[test]
-    fn rebuild_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let archive = test_archive(&tmp);
-        archive.import_bytes(b"x", test_source("x", "1")).unwrap();
-        let mut cat = Catalog::open_in_memory().unwrap();
-        cat.rebuild_from_archive(&archive).unwrap();
-        cat.rebuild_from_archive(&archive).unwrap();
-        assert_eq!(cat.object_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn get_object_returns_correct_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
-        let archive = test_archive(&tmp);
-        let result = archive
-            .import_bytes(b"payload", test_source("doc", "v1"))
-            .unwrap();
-        let mut cat = Catalog::open_in_memory().unwrap();
-        cat.rebuild_from_archive(&archive).unwrap();
-        let obj = cat.get_object(&result.envelope.object_id).unwrap().unwrap();
-        assert_eq!(obj.object_id, result.envelope.object_id);
-        assert_eq!(obj.blob_digest, result.envelope.blob.digest);
-        assert_eq!(obj.blob_size, result.envelope.blob.size);
-        assert_eq!(obj.connector, "filesystem");
-        assert_eq!(obj.source_instance, "test");
-        assert_eq!(obj.external_id, "doc");
-        assert_eq!(obj.revision, "v1");
-    }
-
-    #[test]
-    fn get_object_returns_none_for_unknown_id() {
-        let cat = Catalog::open_in_memory().unwrap();
-        let missing = cat.get_object(&"a".repeat(64)).unwrap();
-        assert!(missing.is_none());
-    }
-
-    #[test]
-    fn job_lifecycle_pending_to_completed() {
-        let cat = Catalog::open_in_memory().unwrap();
-        let job = CatalogJob {
-            job_id: "01JFAKE000000000000000000A".into(),
-            kind: "verify".into(),
-            status: JobStatus::Pending,
-            progress_pct: None,
-            created_at_unix_ms: 1_000_000,
-            updated_at_unix_ms: 1_000_000,
-            error: None,
-        };
-        cat.insert_job(&job).unwrap();
-        let pending = cat.list_jobs(Some(JobStatus::Pending)).unwrap();
-        assert_eq!(pending.len(), 1);
-        let changed = cat
-            .update_job_status(
-                &job.job_id,
-                JobStatus::Completed,
-                Some(100),
-                None,
-                2_000_000,
-            )
-            .unwrap();
-        assert!(changed);
-        assert!(cat.list_jobs(Some(JobStatus::Pending)).unwrap().is_empty());
-        let done = cat.list_jobs(Some(JobStatus::Completed)).unwrap();
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].progress_pct, Some(100));
-    }
-
-    #[test]
-    fn list_all_jobs_returns_all_statuses() {
-        let cat = Catalog::open_in_memory().unwrap();
-        for (id, status) in [
-            ("A", JobStatus::Pending),
-            ("B", JobStatus::Running),
-            ("C", JobStatus::Completed),
-        ] {
-            cat.insert_job(&CatalogJob {
-                job_id: id.into(),
-                kind: "test".into(),
-                status,
-                progress_pct: None,
-                created_at_unix_ms: 1000,
-                updated_at_unix_ms: 1000,
-                error: None,
-            })
-            .unwrap();
-        }
-        assert_eq!(cat.list_jobs(None).unwrap().len(), 3);
-    }
-
-    #[test]
-    fn upsert_object_with_metadata_stores_and_retrieves_fields() {
-        let tmp = tempfile::tempdir().unwrap();
-        let archive = test_archive(&tmp);
-        let result = archive
-            .import_bytes(b"metadata-test", test_source("meta-doc", "v1"))
-            .unwrap();
-        let cat = Catalog::open_in_memory().unwrap();
-
-        cat.upsert_object(
-            &result.envelope,
-            Some("fingerprint-123"),
-            Some("text/markdown"),
-            Some("private"),
-        )
-        .unwrap();
-
-        let obj = cat.get_object(&result.envelope.object_id).unwrap().unwrap();
-        assert_eq!(obj.ingest_fingerprint.as_deref(), Some("fingerprint-123"));
-        assert_eq!(obj.media_type.as_deref(), Some("text/markdown"));
-        assert_eq!(obj.suggested_domain.as_deref(), Some("private"));
-
-        let by_fp = cat
-            .get_object_by_fingerprint("fingerprint-123")
-            .unwrap()
-            .unwrap();
-        assert_eq!(by_fp.object_id, result.envelope.object_id);
-    }
-
-    #[test]
-    fn unique_index_prevents_duplicate_fingerprint_for_different_object() {
-        let cat = Catalog::open_in_memory().unwrap();
-
-        let obj1 = CatalogObject {
-            object_id: "obj-1".into(),
-            blob_digest: "digest-1".into(),
-            blob_size: 10,
-            connector: "filesystem".into(),
-            source_instance: "node1".into(),
-            external_id: "file1".into(),
-            revision: "r1".into(),
-            observed_time_unix_ms: 100,
-            ingested_time_unix_ms: 100,
-            ingest_fingerprint: Some("unique-fp".into()),
-            media_type: None,
-            suggested_domain: None,
-        };
-
-        let obj2 = CatalogObject {
-            object_id: "obj-2".into(),
-            blob_digest: "digest-2".into(),
-            blob_size: 20,
-            connector: "filesystem".into(),
-            source_instance: "node1".into(),
-            external_id: "file2".into(),
-            revision: "r1".into(),
-            observed_time_unix_ms: 200,
-            ingested_time_unix_ms: 200,
-            ingest_fingerprint: Some("unique-fp".into()),
-            media_type: None,
-            suggested_domain: None,
-        };
-
-        cat.upsert_catalog_object(&obj1).unwrap();
-        assert!(cat.upsert_catalog_object(&obj2).is_err());
-
-        assert_eq!(cat.object_count().unwrap(), 1);
-        let by_fp = cat.get_object_by_fingerprint("unique-fp").unwrap().unwrap();
-        assert_eq!(by_fp.object_id, "obj-1");
-    }
-
-    #[test]
-    fn idempotent_upsert_rejects_metadata_drift() {
-        let cat = Catalog::open_in_memory().unwrap();
-        let base = CatalogObject {
-            object_id: "obj-1".into(),
-            blob_digest: "digest-1".into(),
-            blob_size: 10,
-            connector: "filesystem".into(),
-            source_instance: "node1".into(),
-            external_id: "file1".into(),
-            revision: "r1".into(),
-            observed_time_unix_ms: 100,
-            ingested_time_unix_ms: 100,
-            ingest_fingerprint: Some("stable-fp".into()),
-            media_type: Some("text/plain".into()),
-            suggested_domain: Some("private".into()),
-        };
-        cat.upsert_catalog_object(&base).unwrap();
-
-        let mut changed = base.clone();
-        changed.media_type = Some("application/pdf".into());
-        assert!(cat.upsert_catalog_object(&changed).is_err());
-        assert_eq!(
-            cat.get_object("obj-1")
-                .unwrap()
-                .unwrap()
-                .media_type
-                .as_deref(),
-            Some("text/plain")
-        );
-    }
-
-    #[test]
-    fn schema_version_enforced_and_rejects_unsupported() {
-        let cat = Catalog::open_in_memory().unwrap();
-        assert_eq!(cat.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(cat.schema_version().unwrap(), 1);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        {
-            let disk_cat = Catalog::open(&db_path).unwrap();
-            assert_eq!(disk_cat.schema_version().unwrap(), 1);
-        }
-        {
-            let disk_cat = Catalog::open(&db_path).unwrap();
-            assert_eq!(disk_cat.schema_version().unwrap(), 1);
-        }
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute("PRAGMA user_version = 99", []).unwrap();
-        }
-        let err = match Catalog::open(&db_path) {
-            Ok(_) => panic!("expected error opening database with unsupported user_version"),
-            Err(e) => e,
-        };
-        assert!(matches!(err, Error::Invalid(_)));
-    }
-
-    #[test]
-    fn catalog_meta_get_and_set() {
-        let cat = Catalog::open_in_memory().unwrap();
-        assert_eq!(cat.get_meta("nonexistent").unwrap(), None);
-
-        cat.set_meta("custom_key", "custom_val").unwrap();
-        assert_eq!(
-            cat.get_meta("custom_key").unwrap().as_deref(),
-            Some("custom_val")
-        );
-
-        cat.set_meta("custom_key", "updated_val").unwrap();
-        assert_eq!(
-            cat.get_meta("custom_key").unwrap().as_deref(),
-            Some("updated_val")
-        );
-    }
-
-    #[test]
-    fn rebuild_from_archive_records_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
-        let archive = test_archive(&tmp);
-        archive
-            .import_bytes(b"test1", test_source("f1", "1"))
-            .unwrap();
-        archive
-            .import_bytes(b"test2", test_source("f2", "1"))
-            .unwrap();
-
-        let mut cat = Catalog::open_in_memory().unwrap();
-        let count = cat.rebuild_from_archive(&archive).unwrap();
-        assert_eq!(count, 2);
-
-        let last_rebuild = cat.get_meta("last_rebuild_unix_ms").unwrap();
-        assert!(last_rebuild.is_some());
-        let ts: u64 = last_rebuild.unwrap().parse().unwrap();
-        assert!(ts > 0);
-
-        assert_eq!(cat.get_meta("rebuilt_count").unwrap().as_deref(), Some("2"));
-        assert_eq!(
-            cat.get_meta("oiaf_version").unwrap().as_deref(),
-            Some(oiaf::FORMAT_VERSION)
-        );
-    }
-
-    #[test]
-    fn rebuild_purges_stale_orphan_objects() {
-        let tmp = tempfile::tempdir().unwrap();
-        let archive = test_archive(&tmp);
-        let res = archive
-            .import_bytes(b"valid", test_source("valid_file", "1"))
-            .unwrap();
-
-        let mut cat = Catalog::open_in_memory().unwrap();
-
-        let orphan = CatalogObject {
-            object_id: "orphan-id-12345".into(),
-            blob_digest: "stale-blob-digest".into(),
-            blob_size: 999,
-            connector: "filesystem".into(),
-            source_instance: "old".into(),
-            external_id: "old_external".into(),
-            revision: "1".into(),
-            observed_time_unix_ms: 100,
-            ingested_time_unix_ms: 100,
-            ingest_fingerprint: None,
-            media_type: None,
-            suggested_domain: None,
-        };
-        cat.upsert_catalog_object(&orphan).unwrap();
-        assert_eq!(cat.object_count().unwrap(), 1);
-        assert!(cat.get_object("orphan-id-12345").unwrap().is_some());
-
-        let count = cat.rebuild_from_archive(&archive).unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(cat.object_count().unwrap(), 1);
-
-        assert!(cat.get_object("orphan-id-12345").unwrap().is_none());
-        assert!(cat.get_object(&res.envelope.object_id).unwrap().is_some());
-    }
-
-    #[test]
-    fn rebuild_transaction_rollback_preserves_prior_state_on_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let archive = test_archive(&tmp);
-        let res = archive
-            .import_bytes(b"valid-init", test_source("init_file", "1"))
-            .unwrap();
-
-        let mut cat = Catalog::open_in_memory().unwrap();
-        cat.rebuild_from_archive(&archive).unwrap();
-        assert_eq!(cat.object_count().unwrap(), 1);
-
-        let manifest_path = tmp.path().join("archive/manifest.json");
-        std::fs::write(&manifest_path, b"corrupted non-json manifest").unwrap();
-
-        let err = cat.rebuild_from_archive(&archive).unwrap_err();
-        assert!(matches!(err, Error::Archive(_)));
-
-        assert_eq!(cat.object_count().unwrap(), 1);
-        assert!(cat.get_object(&res.envelope.object_id).unwrap().is_some());
-    }
-
-    #[test]
-    fn record_and_list_audit_events() {
-        let cat = Catalog::open_in_memory().unwrap();
-        assert!(cat.list_audit_events(10).unwrap().is_empty());
-
-        let evt1 = AuditEvent {
-            id: "evt-001".into(),
-            event_type: "auth.login".into(),
-            actor: "user-alice".into(),
-            object_id: None,
-            details_json: Some(r#"{"ip":"127.0.0.1"}"#.into()),
-            created_unix_ms: 1000,
-        };
-        let evt2 = AuditEvent {
-            id: "evt-002".into(),
-            event_type: "archive.delete".into(),
-            actor: "guard-session".into(),
-            object_id: Some("obj-999".into()),
-            details_json: None,
-            created_unix_ms: 2000,
-        };
-
-        cat.record_audit_event(&evt1).unwrap();
-        cat.record_audit_event(&evt2).unwrap();
-
-        let events = cat.list_audit_events(10).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0], evt2);
-        assert_eq!(events[1], evt1);
-    }
-
-    #[test]
-    fn audit_events_ordered_by_created_desc_and_bounded_by_limit() {
-        let cat = Catalog::open_in_memory().unwrap();
-        for (id, ts) in [("e1", 1000), ("e3", 3000), ("e2", 2000), ("e4", 4000)] {
-            cat.record_audit_event(&AuditEvent {
-                id: id.into(),
-                event_type: "test".into(),
-                actor: "actor".into(),
-                object_id: None,
-                details_json: None,
-                created_unix_ms: ts,
-            })
-            .unwrap();
-        }
-
-        let all = cat.list_audit_events(10).unwrap();
-        assert_eq!(all.len(), 4);
-        assert_eq!(all[0].id, "e4");
-        assert_eq!(all[1].id, "e3");
-        assert_eq!(all[2].id, "e2");
-        assert_eq!(all[3].id, "e1");
-
-        let top2 = cat.list_audit_events(2).unwrap();
-        assert_eq!(top2.len(), 2);
-        assert_eq!(top2[0].id, "e4");
-        assert_eq!(top2[1].id, "e3");
-    }
-
-    #[test]
-    fn audit_events_rejects_duplicate_id() {
-        let cat = Catalog::open_in_memory().unwrap();
-        let evt = AuditEvent {
-            id: "duplicate-id".into(),
-            event_type: "test".into(),
-            actor: "actor".into(),
-            object_id: None,
-            details_json: None,
-            created_unix_ms: 1000,
-        };
-        cat.record_audit_event(&evt).unwrap();
-        assert!(cat.record_audit_event(&evt).is_err());
-    }
-
-    #[test]
-    fn audit_events_transaction_rollback_safety() {
-        let mut cat = Catalog::open_in_memory().unwrap();
-        let evt = AuditEvent {
-            id: "tx-evt".into(),
-            event_type: "test".into(),
-            actor: "actor".into(),
-            object_id: None,
-            details_json: None,
-            created_unix_ms: 1000,
-        };
-
-        {
-            let tx = cat.conn.transaction().unwrap();
-            tx.execute(
-                "INSERT INTO audit_events (id, event_type, actor, object_id, details_json, created_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    evt.id,
-                    evt.event_type,
-                    evt.actor,
-                    evt.object_id,
-                    evt.details_json,
-                    evt.created_unix_ms as i64,
-                ],
-            )
-            .unwrap();
-        }
-        assert!(cat.list_audit_events(10).unwrap().is_empty());
-
-        cat.record_audit_event(&evt).unwrap();
-        assert_eq!(cat.list_audit_events(10).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn rebuild_from_archive_preserves_audit_events() {
-        let tmp = tempfile::tempdir().unwrap();
-        let archive = test_archive(&tmp);
-        archive
-            .import_bytes(b"data", test_source("f", "1"))
-            .unwrap();
-
-        let mut cat = Catalog::open_in_memory().unwrap();
-        cat.record_audit_event(&AuditEvent {
-            id: "preserve-evt".into(),
-            event_type: "audit.test".into(),
-            actor: "admin".into(),
-            object_id: None,
-            details_json: None,
-            created_unix_ms: 5000,
-        })
-        .unwrap();
-
-        cat.rebuild_from_archive(&archive).unwrap();
-        let events = cat.list_audit_events(10).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "preserve-evt");
-    }
-
-    // new tests
-    #[test]
-    fn list_objects_by_domain_and_count() {
-        let cat = Catalog::open_in_memory().unwrap();
-        let obj1 = CatalogObject {
-            object_id: "obj-1".into(),
-            blob_digest: "d1".into(),
-            blob_size: 10,
-            connector: "c1".into(),
-            source_instance: "s1".into(),
-            external_id: "e1".into(),
-            revision: "r1".into(),
-            observed_time_unix_ms: 100,
-            ingested_time_unix_ms: 100,
-            ingest_fingerprint: None,
-            media_type: None,
-            suggested_domain: Some("alpha".into()),
-        };
-        let obj2 = CatalogObject {
-            object_id: "obj-2".into(),
-            blob_digest: "d2".into(),
-            blob_size: 20,
-            connector: "c2".into(),
-            source_instance: "s2".into(),
-            external_id: "e2".into(),
-            revision: "r2".into(),
-            observed_time_unix_ms: 200,
-            ingested_time_unix_ms: 200,
-            ingest_fingerprint: None,
-            media_type: None,
-            suggested_domain: Some("beta".into()),
-        };
-        let obj3 = CatalogObject {
-            object_id: "obj-3".into(),
-            blob_digest: "d3".into(),
-            blob_size: 30,
-            connector: "c3".into(),
-            source_instance: "s3".into(),
-            external_id: "e3".into(),
-            revision: "r3".into(),
-            observed_time_unix_ms: 300,
-            ingested_time_unix_ms: 300,
-            ingest_fingerprint: None,
-            media_type: None,
-            suggested_domain: Some("alpha".into()),
-        };
-        cat.upsert_catalog_object(&obj1).unwrap();
-        cat.upsert_catalog_object(&obj2).unwrap();
-        cat.upsert_catalog_object(&obj3).unwrap();
-
-        let alpha_objs = cat.list_objects_by_domain("alpha").unwrap();
-        assert_eq!(alpha_objs.len(), 2);
-        assert_eq!(alpha_objs[0].object_id, "obj-1");
-        assert_eq!(alpha_objs[1].object_id, "obj-3");
-
-        let beta_objs = cat.list_objects_by_domain("beta").unwrap();
-        assert_eq!(beta_objs.len(), 1);
-        assert_eq!(beta_objs[0].object_id, "obj-2");
-
-        assert_eq!(cat.domain_object_count("alpha").unwrap(), 2);
-        assert_eq!(cat.domain_object_count("beta").unwrap(), 1);
-        assert_eq!(cat.domain_object_count("gamma").unwrap(), 0);
-    }
-
-    #[test]
-    fn rebuild_preserves_domain_indexing() {
-        let mut cat = Catalog::open_in_memory().unwrap();
-        let foo = "foo";
-        let obj = CatalogObject {
-            object_id: "obj-1".into(),
-            blob_digest: "d1".into(),
-            blob_size: 10,
-            connector: "c1".into(),
-            source_instance: "s1".into(),
-            external_id: "e1".into(),
-            revision: "r1".into(),
-            observed_time_unix_ms: 100,
-            ingested_time_unix_ms: 100,
-            ingest_fingerprint: None,
-            media_type: None,
-            suggested_domain: Some(foo.into()),
-        };
-        cat.upsert_catalog_object(&obj).unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
-        let archive = test_archive(&tmp);
-        let env = archive
-            .import_bytes(b"obj-1", test_source("file", "1"))
-            .unwrap();
-        cat.rebuild_from_archive(&archive).unwrap();
-        cat.set_suggested_domain(&env.envelope.object_id, Some(foo))
-            .unwrap();
-        cat.rebuild_from_archive(&archive).unwrap();
-        let domain_objs = cat.list_objects_by_domain(foo).unwrap();
-        assert_eq!(domain_objs.len(), 1);
-        assert_eq!(cat.domain_object_count(foo).unwrap(), 1);
-        assert_eq!(cat.object_count().unwrap(), 1);
-    }
-}
+#[path = "tests/mod.rs"]
+mod tests;

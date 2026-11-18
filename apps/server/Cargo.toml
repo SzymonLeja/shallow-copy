@@ -8,7 +8,9 @@ description = "Core REST API Server and Orchestration Runtime for shallow-copy"
 [dependencies]
 axum = "0.8"
 oiaf = { path = "../../crates/oiaf" }
+rand = "0.8"
 sc-connector-browser-chromium = { path = "../../connectors/browser-chromium" }
+sc-crypto = { path = "../../crates/crypto" }
 sc-ingest = { path = "../../crates/ingest" }
 sc-policy = { path = "../../crates/policy" }
 sc-preservation-guard = { path = "../../crates/preservation-guard" }

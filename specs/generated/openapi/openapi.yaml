@@ -387,7 +387,12 @@ paths:
     post:
       operationId: SystemSetupApi_configure
       description: Execute first-run core setup configuration (replays will be rejected)
-      parameters: []
+      parameters:
+        - name: x-bootstrap-token
+          in: header
+          required: false
+          schema:
+            type: string
       responses:
         '200':
           description: The request has succeeded.
@@ -405,6 +410,33 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/SystemSetupRequest'
+  /v1/system/setup/claim-legacy:
+    post:
+      operationId: SystemSetupApi_claimLegacy
+      description: Claim owner credentials on an unconfigured legacy installation
+      parameters:
+        - name: x-bootstrap-token
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/SystemSetupResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - System
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LegacyClaimRequest'
 components:
   schemas:
     ArchiveDomain:
@@ -764,6 +796,19 @@ components:
         - completed
         - failed
         - cancelled
+    LegacyClaimRequest:
+      type: object
+      required:
+        - ownerPassword
+        - recoveryConfirmed
+      properties:
+        ownerPassword:
+          type: string
+          description: Non-empty initial owner passphrase
+        recoveryConfirmed:
+          type: boolean
+          description: Acknowledgment confirming recovery material has been recorded and verified
+      description: Request body to claim unconfigured legacy credentials
     LoginRequest:
       type: object
       required:
@@ -938,6 +983,9 @@ components:
         recoveryConfirmed:
           type: boolean
           description: Acknowledgment confirming recovery material has been recorded and verified
+        ownerPassword:
+          type: string
+          description: Non-empty initial owner passphrase
       description: Request body to complete first-run core setup
     SystemSetupResponse:
       type: object
@@ -977,6 +1025,9 @@ components:
         isComplete:
           type: boolean
           description: True if the first-run setup has completed
+        legacyCredentialClaimRequired:
+          type: boolean
+          description: True if an unmigrated legacy installation requires owner credential claim
         archivePath:
           type: string
           description: Safe canonicalized archive path if initialized

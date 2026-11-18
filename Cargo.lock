@@ -1070,7 +1070,9 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "oiaf",
+ "rand",
  "sc-connector-browser-chromium",
+ "sc-crypto",
  "sc-ingest",
  "sc-policy",
  "sc-preservation-guard",

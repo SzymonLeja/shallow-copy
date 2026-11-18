@@ -4,14 +4,18 @@ services:
       context: .
       dockerfile: Dockerfile
     image: shallow-copy-server:latest
+    # Ports published only on 127.0.0.1 by default for safe local development.
+    # To expose to LAN, explicitly change host bindings to 0.0.0.0 or LAN IP and supply a strong secret BOOTSTRAP_TOKEN.
     ports:
-      - "3000:8080"
-      - "8080:8080"
+      - "127.0.0.1:3000:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       - RUST_LOG=info
       - ARCHIVE_PATH=/data/archive/store
       - CATALOG_PATH=/data/state/catalog.sqlite
       - PORT=8080
+      - BIND_ADDR=0.0.0.0
+      - BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN:?BOOTSTRAP_TOKEN environment variable must be set to a non-empty secret}
     volumes:
       - archive-data:/data/archive
       - state-data:/data/state

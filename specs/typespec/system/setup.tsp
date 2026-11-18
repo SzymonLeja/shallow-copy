@@ -15,6 +15,8 @@ model SystemSetupStatus {
   recoveryConfigured: boolean;
   /** True if the first-run setup has completed */
   isComplete: boolean;
+  /** True if an unmigrated legacy installation requires owner credential claim */
+  legacyCredentialClaimRequired?: boolean;
   /** Safe canonicalized archive path if initialized */
   archivePath?: string;
   /** Safe canonicalized backup target directory path if configured */
@@ -27,6 +29,16 @@ model SystemSetupRequest {
   archivePath?: string;
   /** Optional local directory backup target */
   backupPath?: string;
+  /** Acknowledgment confirming recovery material has been recorded and verified */
+  recoveryConfirmed: boolean;
+  /** Non-empty initial owner passphrase */
+  ownerPassword?: string;
+}
+
+/** Request body to claim unconfigured legacy credentials */
+model LegacyClaimRequest {
+  /** Non-empty initial owner passphrase */
+  ownerPassword: string;
   /** Acknowledgment confirming recovery material has been recorded and verified */
   recoveryConfirmed: boolean;
 }
@@ -50,5 +62,16 @@ interface SystemSetupApi {
 
   /** Execute first-run core setup configuration (replays will be rejected) */
   @post
-  configure(@body body: SystemSetupRequest): SystemSetupResponse | ErrorResponse;
+  configure(
+    @header("x-bootstrap-token") bootstrapToken?: string,
+    @body body: SystemSetupRequest,
+  ): SystemSetupResponse | ErrorResponse;
+
+  /** Claim owner credentials on an unconfigured legacy installation */
+  @post
+  @route("/claim-legacy")
+  claimLegacy(
+    @header("x-bootstrap-token") bootstrapToken?: string,
+    @body body: LegacyClaimRequest,
+  ): SystemSetupResponse | ErrorResponse;
 }
